@@ -7,22 +7,23 @@
 ![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)
 
 ## 📖 Abstract
-This project implements a **Knowledge Graph Augmented Generation (GraphRAG)** architecture to process unstructured financial disclosures utilizing local, open-weights Large Language Models (LLMs). This research explores the inherent vulnerabilities in standard Knowledge Graph extraction—specifically Information Extraction Loss and Acronym Blindspots—and implements a robust **Hybrid Graph + Vector Retrieval** system to mitigate them under local edge-hardware constraints.
-
-This project serves as a proof-of-concept for engineering production-grade, hallucination-resistant retrieval pipelines independent of closed-source API models.
+This project is a proof-of-concept **GraphRAG (Knowledge Graph Augmented Generation)** pipeline for processing unstructured financial disclosures using local, open-weights LLMs. It explores two concrete failure modes that show up when running knowledge-graph extraction on a small (7B) local model instead of a large hosted one — **entity resolution blindspots** and **information loss during structured extraction** — and documents the fixes attempted for each, including their limitations.
 
 ## 🚀 Key Milestones & Findings
 
 ### 1. The Acronym Blindspot (Entity Resolution)
-Initial experiments using Levenshtein Distance (Lexical matching) failed to link un-normalized entities (e.g., "SVB" and "Silicon Valley Bank") due to low string similarity. By implementing **Semantic Vector Clustering**, the system successfully bridged these gaps.
-* **Threshold Tuning:** Tuning the Cosine Similarity threshold down to `0.71` successfully merged contextual acronyms.
-* **Graph Collapse:** Lowering thresholds below `0.70` caused representation ruin ("Graph Collapse"), erroneously merging distinct entities like *Apple* and *Microsoft*. Array-safe property extraction was engineered to handle these merges dynamically.
+Lexical matching (Levenshtein, threshold 0.80) found **zero** matches between un-normalized entity names like "SVB" and "Silicon Valley Bank" — the string similarity between them is too low for edit-distance matching to help.
 
-### 2. Mitigating Information Extraction Loss
-Standard schema-based extractors forced the 7B LLM to drop highly specific contextual phrases (e.g., discarding "supply chain issues") to fit strict `<Subject> <Predicate> <Object>` formats. By transitioning to an `ImplicitPathExtractor`, the pipeline explicitly preserved raw text chunks as a safety net alongside the structural graph nodes.
+Switching to **semantic (embedding-based) clustering** did better, but the right threshold wasn't obvious upfront. At cosine similarity 0.85, only one pair merged. Diagnosing specific pairs showed "Silicon valley bank" / "Svb financial group" scored 0.719 — below the 0.85 cutoff. Lowering the threshold to 0.71 did correctly merge the SVB pair, **but in the same run it also incorrectly merged two unrelated entities, "Apple inc." and "Microsoft corp" (score 0.720)**. The two problems sit on either side of the exact same threshold — there's no single cutoff in this experiment that resolves true acronym pairs without also risking false merges between unrelated entities. (Separately, node IDs returned by Neo4j/APOC after a merge come back as a list rather than a string, which needed a small type-check fix before clustering could run on them.)
 
-### 3. Overcoming Small-Model Prompt Choking
-When querying dense graph structures, orchestration frameworks inject heavy formatting strings. The local 7B model choked on this syntax, falling into repetitive generation loops. A custom, streamlined prompt template and a `VectorContextRetriever(include_text=True)` were implemented to force the engine to read both relational edges and raw text safely.
+### 2. Two Distinct Extraction Failures, Diagnosed Separately
+Two different problems showed up at two different stages, and they needed two different fixes:
+
+- **Schema-constrained extraction was unstable.** Forcing the 7B model to extract strictly into a fixed `<Subject> <Predicate> <Object>` schema (`SchemaLLMPathExtractor`) caused unstable relationship generation. Switching to an unconstrained path extractor (`SimpleLLMPathExtractor`) produced a more stable graph.
+- **The retriever was only returning compressed triples, not source text.** Inspecting retrieved nodes directly showed the retriever surfacing extracted facts like `Apple inc. -> Located in -> Asia` instead of the original sentence — context useful for graph traversal, but too lossy for open-ended Q&A. Rebuilding the retriever with `VectorContextRetriever(..., include_text=True)` restored access to the original text alongside the graph relations.
+
+### 3. Small-Model Generation Loops
+The local 7B model, when given a default retrieval-augmented prompt, fell into repetitive self-dialogue loops (generating its own fake "Query: ... Answer: ..." turns instead of stopping). A minimal custom prompt template, explicitly instructing the model to answer the query directly from context, resolved this for subsequent queries.
 
 ---
 
@@ -30,40 +31,27 @@ When querying dense graph structures, orchestration frameworks inject heavy form
 
 * **LLM Engine:** `Qwen/Qwen2.5-7B-Instruct` (Quantized to 4-bit via `bitsandbytes` for consumer GPU hardware).
 * **Embeddings:** `BAAI/bge-small-en-v1.5` for vector search and semantic clustering.
-* **Orchestration:** LlamaIndex (Core, Neo4j, HuggingFace integrations).
+* **Orchestration:** LlamaIndex (Core, Neo4j, HuggingFace integrations) — `SimpleLLMPathExtractor` for graph construction, `VectorContextRetriever` for retrieval.
 * **Graph Database:** Neo4j (AuraDB Cloud).
 * **Algorithms:** Levenshtein Distance (Lexical Resolution), Cosine Similarity (Semantic Resolution).
 
 ---
 
-## 📊 Visualizations & Data Analysis
+## 💻 Output Examples: Entity Bridging via Semantic Resolution
 
-### Entity Resolution: Semantic Clustering vs. Graph Collapse
-*Visual representation demonstrates the 0.71 semantic threshold successfully linking SVB variants, contrasted with the 0.70 threshold incorrectly collapsing distinct tech entities (Apple and Microsoft) into a single corrupted node.*
+**Prompt:** *"What specific economic pressures heavily impacted SVB's capital ratios?"*
 
-### Hybrid Retrieval Architecture Flow
-*Diagram illustrating the dual-retrieval path: executing Cypher queries for relational structural data while simultaneously computing vector similarities for granular, raw-text fallback to prevent information extraction loss.*
+**Response:**
+> "Interest rate risks heavily impacted Silicon Valley Bank's capital ratios..."
 
----
+The query refers to the entity only as "SVB," while the underlying document text uses "Silicon Valley Bank." The system correctly bridges the two, reflecting the semantic entity-resolution step described above.
 
-## 💻 Output Examples: Hybrid GraphRAG Retrieval
-
-**Prompt:** *"What specific supply chain issues or operational challenges did Apple (AAPL) face in Asia?"*
-
-**Baseline (Naive KG Extractor):**
-> "The given context does not provide any specific information about supply chain issues or operational challenges faced by Apple Inc. in Asia. Therefore, based on the provided context, it's not possible to answer this question accurately." 
-> 
-> *(Note: The data was permanently lost during strict triplet extraction).*
-
-**Steered/Production (Hybrid Retriever + Preserved Text):**
-> "The context mentions that Apple Inc. faced supply chain issues without giving further details. To accurately answer this question, more detailed operational information would be needed." 
-> 
-> *(Note: The hybrid vector fallback successfully bypassed the broken graph structure and retrieved the granular raw text chunk).*
+*Note: not every retrieval gap was fully closed — a separate query asking about Apple's supply chain issues returned a "context does not provide this information" response even after the retriever fix, since the source documents didn't contain that detail in the first place. `include_text=True` fixed the context-loss problem but doesn't manufacture information that was never extracted or present in the corpus.*
 
 ---
 
 ## 🔮 Future Work: Cross-Domain Scale & Automated Thresholds
-This architecture establishes the baseline for scalable local GraphRAG. Future work will extend this pipeline to investigate **Dynamic Thresholding**—utilizing a secondary local classification model to automatically adjust semantic merging thresholds at runtime based on the specific industry domain (e.g., Biomedical vs. Financial text) to entirely prevent Graph Collapse.
+This architecture establishes a baseline for local GraphRAG experimentation. Future work will extend this pipeline to investigate **Dynamic Thresholding**—utilizing a secondary local classification model to automatically adjust semantic merging thresholds at runtime based on the specific industry domain (e.g., Biomedical vs. Financial text), aiming to reduce the false-positive merges observed with a fixed threshold.
 
 ---
 
